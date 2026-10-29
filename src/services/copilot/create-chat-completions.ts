@@ -5,10 +5,39 @@ import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 
+import { createResponses } from "./create-responses"
+import {
+  toChatCompletionResponse,
+  toChatCompletionStream,
+  toResponsesPayload,
+} from "./responses-compat"
+
+const responsesOnlyModels = new Set<string>()
+
+const createChatCompletionViaResponses = async (
+  payload: ChatCompletionsPayload,
+) => {
+  const response = await createResponses(toResponsesPayload(payload))
+  if (payload.stream) {
+    return toChatCompletionStream(events(response), payload.model)
+  }
+
+  const completion = toChatCompletionResponse(
+    await response.json(),
+    payload.model,
+  )
+
+  return completion
+}
+
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
+
+  if (responsesOnlyModels.has(payload.model)) {
+    return createChatCompletionViaResponses(payload)
+  }
 
   const enableVision = payload.messages.some(
     (x) =>
@@ -28,15 +57,54 @@ export const createChatCompletions = async (
     "X-Initiator": isAgentCall ? "agent" : "user",
   }
 
-  const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-  })
+  const request = (requestPayload: ChatCompletionsPayload) =>
+    fetch(`${copilotBaseUrl(state)}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(requestPayload),
+    })
+
+  let response = await request(payload)
 
   if (!response.ok) {
-    consola.error("Failed to create chat completions", response)
-    throw new HTTPError("Failed to create chat completions", response)
+    let errorBody = await response.clone().text()
+    const lastMessage = payload.messages.at(-1)
+    if (
+      errorBody.includes("assistant message prefill")
+      && lastMessage?.role === "assistant"
+      && typeof lastMessage.content === "string"
+      && !lastMessage.tool_calls?.length
+    ) {
+      consola.info(
+        `Model ${payload.model} rejected assistant prefill; retrying with a continuation user message`,
+      )
+      response = await request({
+        ...payload,
+        messages: [
+          ...payload.messages,
+          {
+            role: "user",
+            content: "Continue the assistant response above.",
+          },
+        ],
+      })
+      if (!response.ok) {
+        errorBody = await response.clone().text()
+      }
+    }
+
+    if (!response.ok && errorBody.includes("unsupported_api_for_model")) {
+      responsesOnlyModels.add(payload.model)
+      consola.info(
+        `Model ${payload.model} requires the Responses API; retrying with it`,
+      )
+      return createChatCompletionViaResponses(payload)
+    }
+
+    if (!response.ok) {
+      consola.error("Failed to create chat completions", response)
+      throw new HTTPError("Failed to create chat completions", response)
+    }
   }
 
   if (payload.stream) {
@@ -130,6 +198,7 @@ export interface ChatCompletionsPayload {
   temperature?: number | null
   top_p?: number | null
   max_tokens?: number | null
+  max_completion_tokens?: number | null
   stop?: string | Array<string> | null
   n?: number | null
   stream?: boolean | null
