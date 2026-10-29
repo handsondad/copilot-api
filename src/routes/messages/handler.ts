@@ -1,7 +1,7 @@
 import type { Context } from "hono"
 
 import consola from "consola"
-import { streamSSE } from "hono/streaming"
+import { streamSSE, type SSEStreamingApi } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
 import { checkRateLimit } from "~/lib/rate-limit"
@@ -20,7 +20,10 @@ import {
   translateToAnthropic,
   translateToOpenAI,
 } from "./non-stream-translation"
-import { translateChunkToAnthropicEvents } from "./stream-translation"
+import {
+  translateChunkToAnthropicEvents,
+  translateErrorToAnthropicErrorEvent,
+} from "./stream-translation"
 
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
@@ -61,28 +64,54 @@ export async function handleCompletion(c: Context) {
       contentBlockOpen: false,
       toolCalls: {},
     }
+    let messageStopSent = false
 
-    for await (const rawEvent of response) {
-      consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
-      if (rawEvent.data === "[DONE]") {
-        break
+    try {
+      for await (const rawEvent of response) {
+        consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
+        if (rawEvent.data === "[DONE]") {
+          break
+        }
+
+        if (!rawEvent.data) {
+          continue
+        }
+
+        const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
+        const events = translateChunkToAnthropicEvents(chunk, streamState)
+
+        for (const event of events) {
+          consola.debug("Translated Anthropic event:", JSON.stringify(event))
+          await stream.writeSSE({
+            event: event.type,
+            data: JSON.stringify(event),
+          })
+          if (event.type === "message_stop") {
+            messageStopSent = true
+          }
+        }
       }
-
-      if (!rawEvent.data) {
-        continue
-      }
-
-      const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
-      const events = translateChunkToAnthropicEvents(chunk, streamState)
-
-      for (const event of events) {
-        consola.debug("Translated Anthropic event:", JSON.stringify(event))
-        await stream.writeSSE({
-          event: event.type,
-          data: JSON.stringify(event),
-        })
-      }
+    } catch (error) {
+      consola.error(
+        "Failed to process Copilot stream:",
+        error instanceof Error ? error.message : String(error),
+      )
+      await writeStreamingError(stream)
+      return
     }
+
+    if (!messageStopSent) {
+      consola.error("Copilot stream ended before message_stop")
+      await writeStreamingError(stream)
+    }
+  })
+}
+
+const writeStreamingError = async (stream: SSEStreamingApi) => {
+  const event = translateErrorToAnthropicErrorEvent()
+  await stream.writeSSE({
+    event: event.type,
+    data: JSON.stringify(event),
   })
 }
 

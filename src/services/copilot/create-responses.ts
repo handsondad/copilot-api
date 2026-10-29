@@ -49,13 +49,16 @@ export const createResponses = async (
 ): Promise<Response> => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
+  const upstreamPayload = { ...payload }
+  delete upstreamPayload.service_tier
+
   const response = await fetch(`${copilotBaseUrl(state)}/responses`, {
     method: "POST",
     headers: {
       ...copilotHeaders(state, containsInputImage(payload.input)),
       "X-Initiator": isAgentInput(payload.input) ? "agent" : "user",
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(upstreamPayload),
   })
 
   if (!response.ok) throw new HTTPError("Failed to create responses", response)
