@@ -110,3 +110,50 @@ test("preserves successful message_stop events for complete streams", async () =
   expect(body).toContain("event: message_stop")
   expect(body).not.toContain("event: error")
 })
+
+test(
+  "sends ping events while waiting for the upstream stream",
+  async () => {
+    state.copilotToken = "test-token"
+    state.manualApprove = false
+    state.rateLimitSeconds = undefined
+    const fetchMock = Object.assign(
+      async (
+        _input: Parameters<typeof fetch>[0],
+        _init?: Parameters<typeof fetch>[1],
+      ) => {
+        await new Promise((resolve) => setTimeout(resolve, 6_500))
+        return streamResponse(true)
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    globalThis.fetch = fetchMock
+
+    const response = await request()
+    const reader = response.body?.getReader()
+    if (!reader) throw new Error("Expected a streaming response body")
+
+    const decoder = new TextDecoder()
+    const firstChunk = await reader.read()
+    expect(firstChunk.done).toBe(false)
+    if (!(firstChunk.value instanceof Uint8Array)) {
+      throw new TypeError("Expected a byte chunk")
+    }
+    const firstText = decoder.decode(firstChunk.value)
+    expect(firstText).toContain("event: ping")
+
+    let body = firstText
+    while (true) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      if (!(chunk.value instanceof Uint8Array)) {
+        throw new TypeError("Expected a byte chunk")
+      }
+      body += decoder.decode(chunk.value)
+    }
+
+    expect(body).toContain("event: message_start")
+    expect(body).toContain("event: message_stop")
+  },
+  { timeout: 15_000 },
+)

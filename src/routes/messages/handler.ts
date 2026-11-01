@@ -25,6 +25,46 @@ import {
   translateErrorToAnthropicErrorEvent,
 } from "./stream-translation"
 
+const STREAM_PING_INTERVAL_MS = 5_000
+
+const raceWithStreamPing = async <T>(
+  pending: Promise<T>,
+): Promise<{ type: "ping" } | { type: "result"; result: T }> => {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const ping = new Promise<{ type: "ping" }>((resolve) => {
+    timeout = setTimeout(
+      () => resolve({ type: "ping" }),
+      STREAM_PING_INTERVAL_MS,
+    )
+  })
+
+  try {
+    return await Promise.race([
+      pending.then((result) => ({ type: "result" as const, result })),
+      ping,
+    ])
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
+  }
+}
+
+const writePing = async (stream: SSEStreamingApi) =>
+  stream.writeSSE({
+    event: "ping",
+    data: JSON.stringify({ type: "ping" }),
+  })
+
+const waitForWithStreamPings = async <T>(
+  pending: Promise<T>,
+  stream: SSEStreamingApi,
+): Promise<T> => {
+  while (true) {
+    const result = await raceWithStreamPing(pending)
+    if (result.type === "result") return result.result
+    await writePing(stream)
+  }
+}
+
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
 
@@ -39,6 +79,12 @@ export async function handleCompletion(c: Context) {
 
   if (state.manualApprove) {
     await awaitApproval()
+  }
+
+  if (openAIPayload.stream) {
+    return streamSSE(c, (stream) =>
+      streamAnthropicResponse(stream, createChatCompletions(openAIPayload)),
+    )
   }
 
   const response = await createChatCompletions(openAIPayload)
@@ -57,54 +103,66 @@ export async function handleCompletion(c: Context) {
   }
 
   consola.debug("Streaming response from Copilot")
-  return streamSSE(c, async (stream) => {
-    const streamState: AnthropicStreamState = {
-      messageStartSent: false,
-      contentBlockIndex: 0,
-      contentBlockOpen: false,
-      toolCalls: {},
+  return streamSSE(c, (stream) =>
+    streamAnthropicResponse(stream, Promise.resolve(response)),
+  )
+}
+
+const streamAnthropicResponse = async (
+  stream: SSEStreamingApi,
+  responsePromise: ReturnType<typeof createChatCompletions>,
+) => {
+  const streamState: AnthropicStreamState = {
+    messageStartSent: false,
+    contentBlockIndex: 0,
+    contentBlockOpen: false,
+    toolCalls: {},
+  }
+  let messageStopSent = false
+
+  try {
+    const response = await waitForWithStreamPings(responsePromise, stream)
+    if (isNonStreaming(response)) {
+      throw new Error("Expected a streaming response from Copilot")
     }
-    let messageStopSent = false
 
-    try {
-      for await (const rawEvent of response) {
-        consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
-        if (rawEvent.data === "[DONE]") {
-          break
-        }
+    const iterator = response[Symbol.asyncIterator]()
+    while (true) {
+      const next = await waitForWithStreamPings(iterator.next(), stream)
+      if (next.done) break
 
-        if (!rawEvent.data) {
-          continue
-        }
+      const rawEvent = next.value
+      consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
+      if (rawEvent.data === "[DONE]") break
+      if (!rawEvent.data) continue
 
-        const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
-        const events = translateChunkToAnthropicEvents(chunk, streamState)
+      const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
+      const events = translateChunkToAnthropicEvents(chunk, streamState)
 
-        for (const event of events) {
-          consola.debug("Translated Anthropic event:", JSON.stringify(event))
-          await stream.writeSSE({
-            event: event.type,
-            data: JSON.stringify(event),
-          })
-          if (event.type === "message_stop") {
-            messageStopSent = true
-          }
+      for (const event of events) {
+        consola.debug("Translated Anthropic event:", JSON.stringify(event))
+        await stream.writeSSE({
+          event: event.type,
+          data: JSON.stringify(event),
+        })
+        if (event.type === "message_stop") {
+          messageStopSent = true
         }
       }
-    } catch (error) {
-      consola.error(
-        "Failed to process Copilot stream:",
-        error instanceof Error ? error.message : String(error),
-      )
-      await writeStreamingError(stream)
-      return
     }
+  } catch (error) {
+    consola.error(
+      "Failed to process Copilot stream:",
+      error instanceof Error ? error.message : String(error),
+    )
+    await writeStreamingError(stream)
+    return
+  }
 
-    if (!messageStopSent) {
-      consola.error("Copilot stream ended before message_stop")
-      await writeStreamingError(stream)
-    }
-  })
+  if (!messageStopSent) {
+    consola.error("Copilot stream ended before message_stop")
+    await writeStreamingError(stream)
+  }
 }
 
 const writeStreamingError = async (stream: SSEStreamingApi) => {
